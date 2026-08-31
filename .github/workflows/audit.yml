@@ -1,0 +1,146 @@
+name: audit
+
+# Audite l'historique Vélib' stocké sur Hugging Face.
+# Le rapport s'affiche dans l'onglet Actions (résumé du job) et reste
+# téléchargeable en artefact pendant 90 jours.
+#
+# Prérequis : un secret de dépôt nommé HF_TOKEN
+#   Settings > Secrets and variables > Actions > New repository secret
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset HF (ex. pseudo/velib-historique)"
+        required: false
+        type: string
+      dossier_status:
+        description: "Sous-dossier des relevés"
+        required: false
+        default: "raw/status"
+        type: string
+      dossier_info:
+        description: "Sous-dossier du référentiel"
+        required: false
+        default: "raw/information"
+        type: string
+      publier:
+        description: "Committer le rapport dans docs/"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 7 * * 1"   # tous les lundis à 07h00 UTC
+
+concurrency:
+  group: audit
+  cancel-in-progress: true
+
+env:
+  DATASET_DEFAUT: "ton-pseudo/velib-historique"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # nécessaire uniquement pour l'option "publier"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-audit.txt
+
+      - name: Installer les dépendances
+        run: pip install -r requirements-audit.txt
+
+      - name: Résoudre les paramètres
+        id: params
+        run: |
+          DATASET="${{ inputs.dataset }}"
+          [ -z "$DATASET" ] && DATASET="${{ env.DATASET_DEFAUT }}"
+          STATUS="${{ inputs.dossier_status }}"
+          [ -z "$STATUS" ] && STATUS="raw/status"
+          INFO="${{ inputs.dossier_info }}"
+          [ -z "$INFO" ] && INFO="raw/information"
+          {
+            echo "dataset=$DATASET"
+            echo "status=$STATUS"
+            echo "info=$INFO"
+          } >> "$GITHUB_OUTPUT"
+          echo "Dataset audité : $DATASET"
+
+      - name: Télécharger le dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATASET: ${{ steps.params.outputs.dataset }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::Le secret HF_TOKEN n'est pas défini sur ce dépôt."
+            exit 1
+          fi
+          python - <<'PY'
+          import os, pathlib
+          from huggingface_hub import snapshot_download
+
+          chemin = snapshot_download(
+              repo_id=os.environ["DATASET"],
+              repo_type="dataset",
+              token=os.environ["HF_TOKEN"],
+              local_dir="donnees",
+          )
+          fichiers = [f for f in pathlib.Path(chemin).rglob("*") if f.is_file()]
+          taille = sum(f.stat().st_size for f in fichiers) / 1e6
+          print(f"{len(fichiers)} fichiers, {taille:.1f} Mo")
+          PY
+
+      - name: Inspecter le schéma
+        run: python inspecte.py "donnees/${{ steps.params.outputs.status }}"
+
+      - name: Lancer l'audit
+        run: |
+          ARGS=(--status "donnees/${{ steps.params.outputs.status }}/**/*.parquet")
+          if [ -d "donnees/${{ steps.params.outputs.info }}" ]; then
+            ARGS+=(--info "donnees/${{ steps.params.outputs.info }}/**/*.parquet")
+          else
+            echo "Référentiel absent, audit lancé sans --info."
+          fi
+          python audit_velib.py "${ARGS[@]}" --out audit_report.md
+
+      - name: Afficher le rapport dans le résumé du job
+        if: always()
+        run: |
+          if [ -f audit_report.md ]; then
+            {
+              echo "### Audit du $(date -u '+%d/%m/%Y %H:%M UTC')"
+              echo "Dataset : \`${{ steps.params.outputs.dataset }}\`"
+              echo
+              cat audit_report.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Aucun rapport produit." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Archiver le rapport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ github.run_number }}
+          path: audit_report.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Publier dans docs/
+        if: ${{ inputs.publier == true }}
+        run: |
+          mkdir -p docs
+          cp audit_report.md "docs/audit-$(date -u '+%Y-%m-%d').md"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          git diff --staged --quiet || git commit -m "audit: rapport du $(date -u '+%Y-%m-%d')"
+          git push
