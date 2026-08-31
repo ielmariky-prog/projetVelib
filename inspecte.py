@@ -28,8 +28,31 @@ REQUIS = ["station_id", "fetched_at", "last_reported", "num_bikes_available",
 SOUHAITES = ["mechanical", "ebike", "stationCode"]
 
 
+COULEUR = sys.stdout.isatty() and not os.getenv("NO_COLOR")
+
+
 def titre(t):
-    print(f"\n\033[1m--- {t} ---\033[0m")
+    print(f"\n\033[1m--- {t} ---\033[0m" if COULEUR else f"\n--- {t} ---")
+
+
+def config_acces(con, chemin: str):
+    """Configure DuckDB selon la destination : local, hf:// ou s3://."""
+    if chemin.startswith("hf://"):
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        tok = os.getenv("HF_TOKEN")
+        if not tok:
+            sys.exit("Variable HF_TOKEN manquante.\n"
+                     "   export HF_TOKEN=hf_xxxxxxxxxxxx")
+        con.execute(f"CREATE SECRET hf (TYPE HUGGINGFACE, TOKEN '{tok}');")
+    elif chemin.startswith("s3://"):
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        k, sec, e = (os.getenv("R2_ACCESS_KEY_ID"), os.getenv("R2_SECRET_ACCESS_KEY"),
+                     os.getenv("R2_ENDPOINT"))
+        if not all([k, sec, e]):
+            sys.exit("Identifiants R2 manquants : R2_ACCESS_KEY_ID, "
+                     "R2_SECRET_ACCESS_KEY, R2_ENDPOINT")
+        con.execute(f"""CREATE SECRET r2 (TYPE S3, KEY_ID '{k}', SECRET '{sec}',
+                        ENDPOINT '{e}', URL_STYLE 'path', REGION 'auto');""")
 
 
 def trouver(chemin: str):
@@ -232,20 +255,32 @@ def convertir(con, glob, ext, dest):
     print(f'\nLance maintenant :\n   python audit_velib.py --status "{dest}/**/*.parquet"')
 
 
+def telecharger_hf(repo: str, dest: str = "donnees_hf") -> str:
+    """Rapatrie un dataset Hugging Face en local. Ne dépend d'aucune extension DuckDB."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        sys.exit("Installe d'abord :  pip install huggingface_hub")
+    tok = os.getenv("HF_TOKEN")
+    if not tok:
+        sys.exit("Variable HF_TOKEN manquante.\n   export HF_TOKEN=hf_xxxxxxxxxxxx")
+    print(f"Téléchargement de {repo} vers {dest}/ ...")
+    chemin = snapshot_download(repo_id=repo, repo_type="dataset",
+                               token=tok, local_dir=dest)
+    n = sum(1 for _ in pathlib.Path(chemin).rglob("*") if _.is_file())
+    print(f"{n} fichiers récupérés.\n")
+    return chemin
+
+
 def main():
     chemin = sys.argv[1] if len(sys.argv) > 1 else "."
+    if "--hf" in sys.argv:
+        chemin = telecharger_hf(sys.argv[sys.argv.index("--hf") + 1])
     dest = None
     if "--convertir" in sys.argv:
         dest = sys.argv[sys.argv.index("--convertir") + 1]
     con = duckdb.connect()
-    if chemin.startswith("s3://"):
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-        k, s, e = (os.getenv("R2_ACCESS_KEY_ID"), os.getenv("R2_SECRET_ACCESS_KEY"),
-                   os.getenv("R2_ENDPOINT"))
-        if not all([k, s, e]):
-            sys.exit("Identifiants R2 manquants dans l'environnement.")
-        con.execute(f"""CREATE SECRET r2 (TYPE S3, KEY_ID '{k}', SECRET '{s}',
-                        ENDPOINT '{e}', URL_STYLE 'path', REGION 'auto');""")
+    config_acces(con, chemin)
 
     trouves = trouver(chemin)
 
